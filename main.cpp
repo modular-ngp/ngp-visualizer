@@ -11,6 +11,7 @@
 #include <imgui.h>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -18,6 +19,7 @@
 #include <vma/vk_mem_alloc.h>
 #include <vulkan/vulkan.h>
 #include <vv_camera.h>
+#include <shmx_client.h>
 
 #ifndef VK_CHECK
 #define VK_CHECK(expr)                                                                                                             \
@@ -88,6 +90,19 @@ namespace {
         std::array<float, 2> densityRange{0.05f, 1.0f};
         std::array<float, 3> background{0.04f, 0.045f, 0.07f};
         bool showHistogram{true};
+        std::array<char, 64> streamName{};
+        bool autoReconnect{true};
+        bool autoFrameOnFirstRemote{true};
+        bool autoResetDensityOnFirstRemote{true};
+        bool requestDensityReset{false};
+        int maxPoints{200000};
+        bool showTrainingMetrics{true};
+
+        UiState() {
+            streamName.fill(0);
+            constexpr const char* def = "ngp_debug";
+            std::strncpy(streamName.data(), def, streamName.size() - 1);
+        }
     };
 
     struct PointFieldStats {
@@ -95,6 +110,51 @@ namespace {
         float densityMax{std::numeric_limits<float>::lowest()};
         std::array<float, 64> histogram{};
     };
+
+    struct StreamingMetrics {
+        uint64_t frameSeq{0};
+        uint32_t iteration{0};
+        double timestamp{0.0};
+        float loss{std::numeric_limits<float>::quiet_NaN()};
+        float psnr{std::numeric_limits<float>::quiet_NaN()};
+        float learningRate{std::numeric_limits<float>::quiet_NaN()};
+        vv::float3 cameraPos{};
+        vv::float3 cameraTarget{};
+        bool hasCameraPos{false};
+        bool hasCameraTarget{false};
+    };
+
+    struct StreamingState {
+        bool enabled{true};
+        bool connected{false};
+        std::string activeStream{"ngp_debug"};
+        std::string lastError{};
+        uint32_t staticGen{0};
+        uint64_t lastFrameId{std::numeric_limits<uint64_t>::max()};
+        std::chrono::steady_clock::time_point lastFrameTime{};
+        size_t rawPointCount{0};
+        size_t usedPointCount{0};
+        bool firstFrameReceived{false};
+        StreamingMetrics metrics{};
+    };
+
+    namespace ngp_streams {
+        inline constexpr uint32_t FrameSeq     = 1;
+        inline constexpr uint32_t Timestamp    = 2;
+        inline constexpr uint32_t Iteration    = 3;
+        inline constexpr uint32_t Positions    = 100;
+        inline constexpr uint32_t Colors       = 101;
+        inline constexpr uint32_t Normals      = 102;
+        inline constexpr uint32_t Density      = 200;
+        inline constexpr uint32_t Opacity      = 201;
+        inline constexpr uint32_t Features     = 202;
+        inline constexpr uint32_t Loss         = 300;
+        inline constexpr uint32_t Psnr         = 301;
+        inline constexpr uint32_t LearningRate = 302;
+        inline constexpr uint32_t CameraPos    = 400;
+        inline constexpr uint32_t CameraTarget = 401;
+        inline constexpr uint32_t CameraMatrix = 402;
+    }
 
     float saturate(float v) {
         return std::clamp(v, 0.0f, 1.0f);
@@ -181,6 +241,15 @@ namespace {
             create_pipeline_layout();
             create_pipeline();
 
+            streaming_             = StreamingState{};
+            streaming_.activeStream = sanitize_stream_name(ui_.streamName);
+            streaming_.enabled      = true;
+            streaming_.lastFrameId  = std::numeric_limits<uint64_t>::max();
+            lastConnectAttempt_      = std::chrono::steady_clock::time_point{};
+            if (ui_.autoReconnect) {
+                try_connect(true);
+            }
+
             camera_.set_scene_bounds(sceneBounds_);
             camera_.frame_scene(1.08f);
         }
@@ -189,6 +258,7 @@ namespace {
             if (eng.device != VK_NULL_HANDLE) {
                 vkDeviceWaitIdle(eng.device);
             }
+            disconnect();
             destroy_pipeline();
             destroy_descriptor_layout();
             destroy_buffer(pointBuffer_);
@@ -205,6 +275,10 @@ namespace {
 
         void simulate(const EngineContext&, const FrameContext& frm) override {
             camera_.update(frm.dt_sec, static_cast<int>(frm.extent.width), static_cast<int>(frm.extent.height));
+        }
+
+        void update(const EngineContext& eng, const FrameContext&) override {
+            poll_stream_data(eng);
         }
 
         void record_graphics(VkCommandBuffer cmd, const EngineContext& eng, const FrameContext& frm) override {
@@ -291,12 +365,115 @@ namespace {
 
     private:
         void draw_field_controls_panel(const FrameContext& frm) {
+            ImGui::SeparatorText("Streaming");
+            bool edited = ImGui::InputText("Stream", ui_.streamName.data(), ui_.streamName.size());
+            if (edited && !ui_.autoReconnect) {
+                streaming_.activeStream = sanitize_stream_name(ui_.streamName);
+            }
+            if (ImGui::IsItemDeactivatedAfterEdit()) {
+                std::string desired = sanitize_stream_name(ui_.streamName);
+                if (streaming_.connected && desired != streaming_.activeStream) {
+                    disconnect();
+                }
+                if (ui_.autoReconnect) {
+                    streaming_.activeStream = desired;
+                    try_connect(true);
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button(streaming_.connected ? "Disconnect" : "Connect")) {
+                if (streaming_.connected) {
+                    disconnect();
+                } else {
+                    try_connect(true);
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Apply##stream")) {
+                disconnect();
+                try_connect(true);
+            }
+
+            ImGui::Checkbox("Auto Reconnect", &ui_.autoReconnect);
+            ImGui::SameLine();
+            ImGui::Checkbox("Auto Frame First Remote", &ui_.autoFrameOnFirstRemote);
+            ImGui::SameLine();
+            ImGui::Checkbox("Auto Reset Density", &ui_.autoResetDensityOnFirstRemote);
+
+            if (ImGui::Button("Reset Density Window")) {
+                ui_.requestDensityReset = true;
+                reset_density_window();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Frame Scene##manual")) {
+                camera_.frame_scene(1.05f);
+            }
+
+            const auto now          = std::chrono::steady_clock::now();
+            const bool hasFrameTime = streaming_.lastFrameTime != std::chrono::steady_clock::time_point{};
+            const double ageSeconds = streaming_.connected && hasFrameTime ? std::chrono::duration<double>(now - streaming_.lastFrameTime).count() : std::numeric_limits<double>::infinity();
+            const bool stale        = streaming_.connected && ageSeconds > 1.0;
+            ImVec4 statusColor      = streaming_.connected ? (stale ? ImVec4(0.95f, 0.75f, 0.2f, 1.0f) : ImVec4(0.45f, 0.85f, 0.45f, 1.0f)) : ImVec4(0.9f, 0.45f, 0.45f, 1.0f);
+            const char* statusText  = streaming_.connected ? (stale ? "Connected (stale)" : "Connected") : "Disconnected";
+            ImGui::TextColored(statusColor, "%s", statusText);
+            if (streaming_.connected) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("stream: %s", streaming_.activeStream.c_str());
+            }
+            if (!streaming_.lastError.empty()) {
+                ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.35f, 1.0f), "Last error: %s", streaming_.lastError.c_str());
+            }
+
+            if (streaming_.connected) {
+                ImGui::Text("Frame seq: %llu | Frame ID: %llu | Iteration: %u",
+                            static_cast<unsigned long long>(streaming_.metrics.frameSeq),
+                            static_cast<unsigned long long>(streaming_.lastFrameId == std::numeric_limits<uint64_t>::max() ? 0ull : streaming_.lastFrameId),
+                            streaming_.metrics.iteration);
+                if (std::isfinite(ageSeconds)) {
+                    ImGui::Text("Last update: %.2f s ago", ageSeconds);
+                }
+            ImGui::Text("Points: %zu raw -> %zu displayed (limit %d)",
+                            streaming_.rawPointCount,
+                            streaming_.usedPointCount,
+                            ui_.maxPoints);
+                ImGui::Text("Timestamp: %.3f", streaming_.metrics.timestamp);
+            }
+
+            ImGui::Checkbox("Show Training Metrics", &ui_.showTrainingMetrics);
+            if (ui_.showTrainingMetrics && streaming_.connected) {
+                ImGui::SeparatorText("Training Metrics");
+                if (!std::isnan(streaming_.metrics.loss)) {
+                    ImGui::Text("Loss: %.5f", streaming_.metrics.loss);
+                }
+                if (!std::isnan(streaming_.metrics.psnr)) {
+                    ImGui::Text("PSNR: %.2f dB", streaming_.metrics.psnr);
+                }
+                if (!std::isnan(streaming_.metrics.learningRate)) {
+                    ImGui::Text("Learning rate: %.6f", streaming_.metrics.learningRate);
+                }
+                if (streaming_.metrics.hasCameraPos) {
+                    ImGui::Text("Camera pos: (%.2f, %.2f, %.2f)",
+                                streaming_.metrics.cameraPos.x,
+                                streaming_.metrics.cameraPos.y,
+                                streaming_.metrics.cameraPos.z);
+                }
+                if (streaming_.metrics.hasCameraTarget) {
+                    ImGui::Text("Camera target: (%.2f, %.2f, %.2f)",
+                                streaming_.metrics.cameraTarget.x,
+                                streaming_.metrics.cameraTarget.y,
+                                streaming_.metrics.cameraTarget.z);
+                }
+            }
+
+            ImGui::SeparatorText("Sampling & Appearance");
+            if (ui_.maxPoints < 1000) ui_.maxPoints = 1000;
+            ImGui::SliderInt("Max Points", &ui_.maxPoints, 1000, 1000000, "%d", ImGuiSliderFlags_Logarithmic);
+
             const float totalPoints = static_cast<float>(pointCount_);
             ImGui::Text("Samples: %.0f", totalPoints);
             ImGui::SameLine();
             ImGui::TextDisabled("CPU %.2f ms", stats_.cpu_ms);
 
-            ImGui::SeparatorText("Appearance");
             ImGui::SliderFloat("Point Scale", &ui_.pointScale, 0.2f, 6.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
             ImGui::SliderFloat("Intensity", &ui_.intensityScale, 0.2f, 3.5f, "%.2f");
             ImGui::SliderFloat("Opacity", &ui_.opacityScale, 0.05f, 3.0f, "%.2f");
@@ -320,17 +497,16 @@ namespace {
             ImGui::Checkbox("Show Histogram", &ui_.showHistogram);
             if (ui_.showHistogram && pointCount_ > 0) {
                 ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.45f, 0.75f, 1.0f, 1.0f));
-                ImGui::PlotHistogram("##density_histogram", statsInfo_.histogram.data(), static_cast<int>(statsInfo_.histogram.size()), 0, nullptr, 0.0f, 1.0f, {0, 80});
+                ImGui::PlotHistogram("##density_histogram", statsInfo_.histogram.data(), static_cast<int>(statsInfo_.histogram.size()), 0, nullptr, 0.0f, 1.0f, ImVec2(0, 80));
                 ImGui::PopStyleColor();
             }
 
             ImGui::SeparatorText("Frame Stats");
             const auto& camState = camera_.state();
-            ImGui::Text("Camera yaw/pitch: %.1f° / %.1f°", camState.yaw_deg, camState.pitch_deg);
+            ImGui::Text("Camera yaw/pitch: %.1f deg / %.1f deg", camState.yaw_deg, camState.pitch_deg);
             ImGui::Text("Distance: %.2f", camState.distance);
-            ImGui::Text("Frame dt: %.3f s (%.2f ms)", frm.dt_sec, frm.dt_sec * 1000.0);
+            ImGui::Text("Frame dt: %.3f s (%.2f ms)", frm.dt_sec, frm.dt_sec * 1000.0f);
         }
-
         void build_point_field() {
             pointsCpu_.clear();
             statsInfo_   = PointFieldStats{};
@@ -375,6 +551,9 @@ namespace {
                     sceneBounds_.max.z = std::max(sceneBounds_.max.z, p.z);
                 }
             };
+
+            float densityMin = std::numeric_limits<float>::max();
+            float densityMax = std::numeric_limits<float>::lowest();
 
             pointsCpu_.reserve(static_cast<size_t>(gridRes) * gridRes * gridRes / 2);
 
@@ -431,10 +610,8 @@ namespace {
                         pointsCpu_.push_back(v);
                         update_bounds(p);
 
-                        statsInfo_.densityMin = std::min(statsInfo_.densityMin, density);
-                        statsInfo_.densityMax = std::max(statsInfo_.densityMax, density);
-                        const size_t binIdx   = static_cast<size_t>(std::clamp<int>(static_cast<int>(densityNorm * 63.0f), 0, 63));
-                        statsInfo_.histogram[binIdx] += 1.0f;
+                        densityMin = std::min(densityMin, density);
+                        densityMax = std::max(densityMax, density);
                     }
                 }
             }
@@ -445,7 +622,7 @@ namespace {
                 v.px       = pos.x;
                 v.py       = pos.y;
                 v.pz       = pos.z;
-                v.density  = statsInfo_.densityMax * 0.9f;
+                v.density  = densityMax * 0.9f;
                 v.r        = 1.6f;
                 v.g        = 1.2f;
                 v.b        = 0.6f;
@@ -456,21 +633,15 @@ namespace {
                 update_bounds(pos);
             }
 
-            pointCount_ = static_cast<uint32_t>(pointsCpu_.size());
+            pointCount_                 = static_cast<uint32_t>(pointsCpu_.size());
+            streaming_.rawPointCount  = pointsCpu_.size();
+            streaming_.usedPointCount = pointsCpu_.size();
 
-            float maxHist = 0.0f;
-            for (float bin : statsInfo_.histogram) maxHist = std::max(maxHist, bin);
-            if (maxHist > 0.0f) {
-                for (float& bin : statsInfo_.histogram) {
-                    bin /= maxHist;
-                }
+            rebuild_stats_from_points(densityMin, densityMax, true);
+            if (ui_.autoResetDensityOnFirstRemote || ui_.requestDensityReset) {
+                reset_density_window();
+                ui_.requestDensityReset = false;
             }
-
-            if (statsInfo_.densityMin > statsInfo_.densityMax) {
-                statsInfo_.densityMin = 0.0f;
-                statsInfo_.densityMax = 1.0f;
-            }
-            ui_.densityRange = {statsInfo_.densityMin + 0.01f, statsInfo_.densityMax * 0.85f};
         }
 
         void create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VmaAllocationCreateFlags flags, GpuBuffer& out) {
@@ -736,6 +907,364 @@ namespace {
             stats_.draw_calls = pointCount_ ? 1 : 0;
         }
 
+        static std::string sanitize_stream_name(const std::array<char, 64>& buffer) {
+            std::string s(buffer.data());
+            const auto first = s.find_first_not_of(" \t\r\n");
+            if (first == std::string::npos) return {};
+            const auto last = s.find_last_not_of(" \t\r\n");
+            return s.substr(first, last - first + 1);
+        }
+
+        void reset_density_window() {
+            float min = statsInfo_.densityMin;
+            float max = statsInfo_.densityMax;
+            if (!(min <= max)) {
+                min = 0.0f;
+                max = 1.0f;
+            }
+            ui_.densityRange[0] = min;
+            ui_.densityRange[1] = max;
+        }
+
+        void poll_stream_data(const EngineContext& eng) {
+            if (!streaming_.enabled) return;
+
+            if (services_ == nullptr && eng.services != nullptr) {
+                services_ = eng.services;
+            }
+
+            if (!streaming_.connected) {
+                if (ui_.autoReconnect) {
+                    try_connect(false);
+                }
+                return;
+            }
+
+            const auto* header = shmxClient_.header();
+            if (!is_header_valid(header)) {
+                streaming_.lastError = "Shared memory header invalid";
+                disconnect();
+                return;
+            }
+
+            const uint32_t staticGen = header->static_gen.load(std::memory_order_acquire);
+            if (staticGen != streaming_.staticGen) {
+                shmx::StaticState state;
+                if (shmxClient_.refresh_static(state)) {
+                    shmxStatic_          = std::move(state);
+                    streaming_.staticGen = shmxStatic_.static_gen;
+                }
+            }
+
+            shmx::FrameView fv;
+            if (!shmxClient_.latest(fv) || fv.fh == nullptr || fv.checksum_mismatch != 0u) {
+                return;
+            }
+
+            const uint64_t frameId = fv.fh->frame_id.load(std::memory_order_acquire);
+            if (frameId == streaming_.lastFrameId) {
+                return;
+            }
+
+            shmx::DecodedFrame decoded;
+            if (!shmx::Client::decode(fv, decoded)) {
+                streaming_.lastError = "Failed to decode frame";
+                return;
+            }
+
+            if (update_point_cloud_from_frame(fv, decoded)) {
+                streaming_.lastFrameId   = frameId;
+                streaming_.lastFrameTime = std::chrono::steady_clock::now();
+                streaming_.lastError.clear();
+            }
+        }
+
+        void try_connect(bool force) {
+            const auto now = std::chrono::steady_clock::now();
+            if (!force && (now - lastConnectAttempt_) < std::chrono::milliseconds(500)) {
+                return;
+            }
+            lastConnectAttempt_ = now;
+
+            std::string desired = sanitize_stream_name(ui_.streamName);
+            if (desired.empty()) {
+                streaming_.lastError = "Stream name is empty";
+                return;
+            }
+
+            if (streaming_.connected && desired == streaming_.activeStream) {
+                return;
+            }
+
+            shmxClient_.close();
+            streaming_             = StreamingState{};
+            streaming_.activeStream = desired;
+            streaming_.enabled      = true;
+
+            if (!shmxClient_.open(desired)) {
+                streaming_.lastError = "Failed to open stream '" + desired + "'";
+                streaming_.connected = false;
+                return;
+            }
+
+            streaming_.connected    = true;
+            streaming_.lastFrameId  = std::numeric_limits<uint64_t>::max();
+            streaming_.lastError.clear();
+            ui_.requestDensityReset = ui_.autoResetDensityOnFirstRemote;
+
+            shmx::StaticState state;
+            if (shmxClient_.refresh_static(state)) {
+                shmxStatic_          = std::move(state);
+                streaming_.staticGen = shmxStatic_.static_gen;
+            }
+        }
+
+        void disconnect() {
+            shmxClient_.close();
+            streaming_             = StreamingState{};
+            streaming_.activeStream = sanitize_stream_name(ui_.streamName);
+            streaming_.enabled      = true;
+            streaming_.lastError.clear();
+            streaming_.lastFrameId  = std::numeric_limits<uint64_t>::max();
+            streaming_.rawPointCount = 0;
+            streaming_.usedPointCount = 0;
+        }
+
+        static bool is_header_valid(const shmx::GlobalHeader* GH) {
+            if (!GH) return false;
+            if (GH->magic != shmx::MAGIC || GH->ver_major != shmx::VER_MAJOR || GH->ver_minor != shmx::VER_MINOR || GH->endianness != shmx::ENDIAN_TAG) return false;
+            if (GH->slot_stride == 0u || GH->slots_offset == 0u || GH->frame_bytes_cap == 0u) return false;
+            if (GH->reader_slot_stride == 0u || GH->readers_offset == 0u) return false;
+            if (GH->control_stride != 0u && (GH->control_offset == 0u || GH->control_per_reader == 0u)) return false;
+            return true;
+        }
+
+        const shmx::DecodedItem* find_stream(const shmx::DecodedFrame& frame, uint32_t id) const {
+            for (const auto& entry : frame.streams) {
+                if (entry.first == id) return &entry.second;
+            }
+            return nullptr;
+        }
+
+        template <typename T>
+        static std::optional<T> read_scalar(const shmx::DecodedItem* item) {
+            if (!item || item->bytes < sizeof(T) || item->elem_count == 0) return std::nullopt;
+            T value{};
+            std::memcpy(&value, item->ptr, sizeof(T));
+            return value;
+        }
+
+        bool update_point_cloud_from_frame(const shmx::FrameView& fv, const shmx::DecodedFrame& df) {
+            const auto* positionsItem = find_stream(df, ngp_streams::Positions);
+            if (!positionsItem || positionsItem->elem_count == 0) {
+                streaming_.lastError = "Frame missing positions";
+                return false;
+            }
+
+            const size_t rawCount = positionsItem->elem_count;
+            streaming_.rawPointCount = rawCount;
+
+            streaming_.metrics.loss         = std::numeric_limits<float>::quiet_NaN();
+            streaming_.metrics.psnr         = std::numeric_limits<float>::quiet_NaN();
+            streaming_.metrics.learningRate = std::numeric_limits<float>::quiet_NaN();
+            streaming_.metrics.hasCameraPos    = false;
+            streaming_.metrics.hasCameraTarget = false;
+
+            const size_t posComponents = std::max<std::size_t>(1, positionsItem->bytes / (positionsItem->elem_count * sizeof(float)));
+            if (posComponents < 3) {
+                streaming_.lastError = "Positions stream expected 3 components";
+                return false;
+            }
+
+            const float* posPtr = reinterpret_cast<const float*>(positionsItem->ptr);
+            const auto* colorItem = find_stream(df, ngp_streams::Colors);
+            const float* colorPtr = colorItem ? reinterpret_cast<const float*>(colorItem->ptr) : nullptr;
+            const size_t colorComponents = colorItem ? std::max<std::size_t>(1, colorItem->bytes / (colorItem->elem_count * sizeof(float))) : 0;
+
+            const auto* densityItem = find_stream(df, ngp_streams::Density);
+            const float* densityPtr = densityItem ? reinterpret_cast<const float*>(densityItem->ptr) : nullptr;
+            const size_t densityComponents = densityItem ? std::max<std::size_t>(1, densityItem->bytes / (densityItem->elem_count * sizeof(float))) : 0;
+
+            if (rawCount == 0) {
+                streaming_.usedPointCount = 0;
+                return false;
+            }
+
+            size_t targetCount = rawCount;
+            const size_t maxPts = static_cast<size_t>(std::max(ui_.maxPoints, 1));
+            if (rawCount > maxPts) targetCount = maxPts;
+            const size_t stride = std::max<std::size_t>(1, rawCount / targetCount);
+
+            pointsCpu_.resize(targetCount);
+            sceneBounds_ = {};
+            float densityMin = std::numeric_limits<float>::max();
+            float densityMax = std::numeric_limits<float>::lowest();
+
+            for (size_t dst = 0; dst < targetCount; ++dst) {
+                const size_t src = std::min(dst * stride, rawCount - 1);
+                auto& v          = pointsCpu_[dst];
+                const float* p   = posPtr + src * posComponents;
+                v.px             = p[0];
+                v.py             = p[1];
+                v.pz             = p[2];
+
+                if (!sceneBounds_.valid) {
+                    sceneBounds_.min = sceneBounds_.max = vv::make_float3(v.px, v.py, v.pz);
+                    sceneBounds_.valid                  = true;
+                } else {
+                    sceneBounds_.min.x = std::min(sceneBounds_.min.x, v.px);
+                    sceneBounds_.min.y = std::min(sceneBounds_.min.y, v.py);
+                    sceneBounds_.min.z = std::min(sceneBounds_.min.z, v.pz);
+                    sceneBounds_.max.x = std::max(sceneBounds_.max.x, v.px);
+                    sceneBounds_.max.y = std::max(sceneBounds_.max.y, v.py);
+                    sceneBounds_.max.z = std::max(sceneBounds_.max.z, v.pz);
+                }
+
+                float density = 0.5f;
+                if (densityPtr && densityItem->elem_count > src) {
+                    density = densityPtr[src * densityComponents];
+                }
+                v.density = density;
+                densityMin = std::min(densityMin, density);
+                densityMax = std::max(densityMax, density);
+
+                if (colorPtr && colorItem->elem_count > src) {
+                    const float* c = colorPtr + src * colorComponents;
+                    v.r            = c[0];
+                    v.g            = colorComponents > 1 ? c[1] : c[0];
+                    v.b            = colorComponents > 2 ? c[2] : c[0];
+                } else {
+                    v.r = v.g = v.b = 0.0f;
+                }
+
+                v.feature  = 0.0f;
+                v.radius   = 0.0f;
+                v.emissive = 0.0f;
+            }
+
+            if (!(densityMax > densityMin)) {
+                densityMin = 0.0f;
+                densityMax = 1.0f;
+            }
+
+            streaming_.usedPointCount = targetCount;
+
+            if (auto frameSeq = read_scalar<uint64_t>(find_stream(df, ngp_streams::FrameSeq))) {
+                streaming_.metrics.frameSeq = *frameSeq;
+            } else {
+                streaming_.metrics.frameSeq = fv.fh->frame_id.load(std::memory_order_relaxed);
+            }
+            if (auto iter = read_scalar<uint32_t>(find_stream(df, ngp_streams::Iteration))) {
+                streaming_.metrics.iteration = *iter;
+            }
+            if (auto timestamp = read_scalar<double>(find_stream(df, ngp_streams::Timestamp))) {
+                streaming_.metrics.timestamp = *timestamp;
+            } else {
+                streaming_.metrics.timestamp = fv.fh->sim_time;
+            }
+            if (auto loss = read_scalar<float>(find_stream(df, ngp_streams::Loss))) {
+                streaming_.metrics.loss = *loss;
+            }
+            if (auto psnr = read_scalar<float>(find_stream(df, ngp_streams::Psnr))) {
+                streaming_.metrics.psnr = *psnr;
+            }
+            if (auto lr = read_scalar<float>(find_stream(df, ngp_streams::LearningRate))) {
+                streaming_.metrics.learningRate = *lr;
+            }
+            if (const auto* camPosItem = find_stream(df, ngp_streams::CameraPos); camPosItem && camPosItem->bytes >= sizeof(float) * 3) {
+                std::memcpy(&streaming_.metrics.cameraPos, camPosItem->ptr, sizeof(float) * 3);
+                streaming_.metrics.hasCameraPos = true;
+            }
+            if (const auto* camTargetItem = find_stream(df, ngp_streams::CameraTarget); camTargetItem && camTargetItem->bytes >= sizeof(float) * 3) {
+                std::memcpy(&streaming_.metrics.cameraTarget, camTargetItem->ptr, sizeof(float) * 3);
+                streaming_.metrics.hasCameraTarget = true;
+            }
+
+            rebuild_stats_from_points(densityMin, densityMax, colorPtr != nullptr);
+            upload_point_data();
+            camera_.set_scene_bounds(sceneBounds_);
+
+            if (!streaming_.firstFrameReceived) {
+                if (ui_.autoFrameOnFirstRemote && sceneBounds_.valid) {
+                    camera_.frame_scene(1.08f);
+                }
+                if (ui_.autoResetDensityOnFirstRemote) {
+                    reset_density_window();
+                }
+            }
+            if (ui_.requestDensityReset) {
+                reset_density_window();
+                ui_.requestDensityReset = false;
+            }
+            streaming_.firstFrameReceived = true;
+            return true;
+        }
+
+        void rebuild_stats_from_points(float densityMin, float densityMax, bool hasExplicitColors) {
+            statsInfo_ = PointFieldStats{};
+            if (pointsCpu_.empty()) {
+                statsInfo_.densityMin = 0.0f;
+                statsInfo_.densityMax = 1.0f;
+                return;
+            }
+            if (!(densityMax > densityMin)) {
+                densityMin = 0.0f;
+                densityMax = 1.0f;
+            }
+            statsInfo_.densityMin = densityMin;
+            statsInfo_.densityMax = densityMax;
+            statsInfo_.histogram.fill(0.0f);
+            const float range = std::max(1e-6f, densityMax - densityMin);
+            float maxBin = 0.0f;
+            for (auto& v : pointsCpu_) {
+                float norm = std::clamp((v.density - densityMin) / range, 0.0f, 1.0f);
+                v.feature  = norm;
+                v.radius   = 0.0025f + 0.02f * norm;
+                v.emissive = 0.06f * norm;
+                if (!hasExplicitColors) {
+                    auto col = palette_viridis(norm);
+                    v.r      = col[0];
+                    v.g      = col[1];
+                    v.b      = col[2];
+                } else {
+                    v.r = saturate(v.r);
+                    v.g = saturate(v.g);
+                    v.b = saturate(v.b);
+                }
+                const size_t bin = std::min<std::size_t>(statsInfo_.histogram.size() - 1, static_cast<size_t>(norm * (statsInfo_.histogram.size() - 1)));
+                statsInfo_.histogram[bin] += 1.0f;
+                maxBin = std::max(maxBin, statsInfo_.histogram[bin]);
+            }
+            if (maxBin > 1e-6f) {
+                for (float& bin : statsInfo_.histogram) {
+                    bin /= maxBin;
+                }
+            }
+        }
+
+        void ensure_point_buffer_capacity(std::size_t count) {
+            if (count == 0) return;
+            const VkDeviceSize needed = sizeof(PointVertex) * count;
+            if (pointBuffer_.buffer != VK_NULL_HANDLE && needed <= pointBuffer_.size) return;
+            const VkDeviceSize previous = pointBuffer_.size;
+            destroy_buffer(pointBuffer_);
+            VkDeviceSize allocSize = std::max<VkDeviceSize>(needed, previous > 0 ? previous * 2 : needed);
+            allocSize              = std::max<VkDeviceSize>(allocSize, static_cast<VkDeviceSize>(256ull * 1024ull));
+            create_buffer(allocSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT, pointBuffer_);
+        }
+
+        void upload_point_data() {
+            if (pointsCpu_.empty()) {
+                pointCount_ = 0;
+                return;
+            }
+            ensure_point_buffer_capacity(pointsCpu_.size());
+            const VkDeviceSize size = sizeof(PointVertex) * pointsCpu_.size();
+            std::memcpy(pointBuffer_.info.pMappedData, pointsCpu_.data(), static_cast<size_t>(size));
+            VK_CHECK(vmaFlushAllocation(allocator_, pointBuffer_.allocation, 0, size));
+            pointCount_ = static_cast<uint32_t>(pointsCpu_.size());
+        }
+
         void transition_image(VkCommandBuffer cmd, const AttachmentView& view, VkImageLayout oldLayout, VkImageLayout newLayout, VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess) {
             VkImageMemoryBarrier2 barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
             barrier.srcStageMask     = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
@@ -766,6 +1295,11 @@ namespace {
         PointFieldStats statsInfo_{};
         UiState ui_{};
         uint32_t pointCount_{0};
+
+        shmx::Client shmxClient_{};
+        shmx::StaticState shmxStatic_{};
+        StreamingState streaming_{};
+        std::chrono::steady_clock::time_point lastConnectAttempt_{};
 
         GpuBuffer uniformBuffer_{};
         GpuBuffer pointBuffer_{};

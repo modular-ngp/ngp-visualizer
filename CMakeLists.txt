@@ -17,11 +17,20 @@ add_vv_example(
         SHADERS shaders/point_cloud.vert shaders/point_cloud.frag
 )
 
-include(FetchContent)
-FetchContent_Declare(
-        shared-mem-ipc
-        GIT_REPOSITORY https://github.com/HinaPE/shared-mem-ipc.git
-        GIT_TAG master
-)
-FetchContent_MakeAvailable(shared-mem-ipc)
+add_library(shmx INTERFACE)
+add_library(shmx::shmx ALIAS shmx)
+
+find_path(SHMX_INCLUDE_DIR
+        NAMES shmx_client.h
+        PATHS
+            ${CMAKE_CURRENT_BINARY_DIR}/_deps/shared-mem-ipc-src/src
+            ${CMAKE_SOURCE_DIR}/cmake-build-release/_deps/shared-mem-ipc-src/src
+            ${CMAKE_SOURCE_DIR}/_deps/shared-mem-ipc-src/src
+        NO_DEFAULT_PATH)
+
+if (NOT SHMX_INCLUDE_DIR)
+    message(FATAL_ERROR "shmx_client.h not found. Ensure shared-mem-ipc has been prepared under _deps.")
+endif ()
+
+target_include_directories(shmx INTERFACE ${SHMX_INCLUDE_DIR})
 target_link_libraries(ngp-visualizer PRIVATE shmx::shmx)
