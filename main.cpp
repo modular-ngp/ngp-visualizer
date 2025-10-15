@@ -220,11 +220,14 @@ public:
         camera_.update(frm.dt_sec, static_cast<int>(frm.extent.width), static_cast<int>(frm.extent.height));
     }
 
-    void record_graphics(VkCommandBuffer cmd, const EngineContext&, const FrameContext& frm) override {
+    void record_graphics(VkCommandBuffer cmd, const EngineContext& eng, const FrameContext& frm) override {
         if (pointBuffer_.buffer == VK_NULL_HANDLE || pipeline_ == VK_NULL_HANDLE || frm.color_attachments.empty()) return;
 
         const auto frameStart = std::chrono::high_resolution_clock::now();
         update_uniforms(frm);
+        if (services_ == nullptr && eng.services != nullptr) {
+            services_ = eng.services;
+        }
 
         const auto& colorTarget = frm.color_attachments.front();
         transition_image(cmd, colorTarget, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
@@ -272,7 +275,10 @@ public:
         stats_.triangles    = 0;
     }
 
-    void on_imgui(const EngineContext&, const FrameContext& frm) override {
+    void on_imgui(const EngineContext& eng, const FrameContext& frm) override {
+        if (services_ == nullptr && eng.services != nullptr) {
+            services_ = eng.services;
+        }
         if (auto* tabs = static_cast<vv_ui::TabsHost*>(services_)) {
             tabs->set_main_window_title("Instant-NGP Dense Field Debugger");
             FrameContext frame_copy = frm;
