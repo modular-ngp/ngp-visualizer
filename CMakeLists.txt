@@ -14,5 +14,5 @@ include(cmake/setup_func.cmake)
 add_vv_example(
         NAME example_template
         SRC main.cpp
-        SHADERS shaders/triangle.vert shaders/triangle.frag
+        SHADERS shaders/point_cloud.vert shaders/point_cloud.frag
 )
