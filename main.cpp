@@ -273,21 +273,22 @@ public:
     }
 
     void on_imgui(const EngineContext&, const FrameContext& frm) override {
-        ImGuiIO& io = ImGui::GetIO();
-        if (!(io.ConfigFlags & ImGuiConfigFlags_DockingEnable)) {
-            io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
-        }
-        ImGui::DockSpaceOverViewport(ImGui::GetID("MainDockspace"), ImGui::GetMainViewport(), ImGuiDockNodeFlags_PassthruCentralNode);
-
         if (auto* tabs = static_cast<vv_ui::TabsHost*>(services_)) {
             tabs->set_main_window_title("Instant-NGP Dense Field Debugger");
-            tabs->add_tab("Field Controls", [&] { draw_control_ui(frm); });
-            tabs->add_tab("Camera", [&] { camera_.imgui_panel_contents(); });
-            tabs->add_overlay([&] { camera_.imgui_draw_mini_axis_gizmo(); });
-            tabs->add_overlay([&] { camera_.imgui_draw_nav_overlay_space_tint(0x20141432); });
+            FrameContext frame_copy = frm;
+            tabs->add_tab("Field Controls", [this, frame_copy] { draw_field_controls_panel(frame_copy); });
+            tabs->add_tab("Camera", [this] { camera_.imgui_panel_contents(); });
+            tabs->add_overlay([this] { camera_.imgui_draw_mini_axis_gizmo(); });
+            tabs->add_overlay([this] { camera_.imgui_draw_nav_overlay_space_tint(0x20141432); });
         } else {
-            draw_control_ui(frm);
-            camera_.imgui_panel_contents();
+            if (ImGui::Begin("Field Controls")) {
+                draw_field_controls_panel(frm);
+            }
+            ImGui::End();
+            if (ImGui::Begin("Camera")) {
+                camera_.imgui_panel_contents();
+            }
+            ImGui::End();
         }
     }
 
@@ -296,49 +297,45 @@ public:
     }
 
 private:
-    void draw_control_ui(const FrameContext& frm) {
+    void draw_field_controls_panel(const FrameContext& frm) {
         const float totalPoints = static_cast<float>(pointCount_);
+        ImGui::Text("Samples: %.0f", totalPoints);
+        ImGui::SameLine();
+        ImGui::TextDisabled("CPU %.2f ms", stats_.cpu_ms);
 
-        if (ImGui::Begin("Field Controls")) {
-            ImGui::Text("Samples: %.0f", totalPoints);
-            ImGui::SameLine();
-            ImGui::TextDisabled("(CPU %.2f ms)", stats_.cpu_ms);
+        ImGui::SeparatorText("Appearance");
+        ImGui::SliderFloat("Point Scale", &ui_.pointScale, 0.2f, 6.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+        ImGui::SliderFloat("Intensity", &ui_.intensityScale, 0.2f, 3.5f, "%.2f");
+        ImGui::SliderFloat("Opacity", &ui_.opacityScale, 0.05f, 3.0f, "%.2f");
+        ImGui::SliderFloat("Splat Sharpness", &ui_.splatSharpness, 1.0f, 6.0f, "%.2f");
+        ImGui::SliderFloat("Depth Fade", &ui_.depthFade, 0.0f, 1.2f, "%.2f");
+        ImGui::SliderFloat("Gamma", &ui_.gamma, 0.6f, 2.2f, "%.2f");
+        ImGui::SliderFloat("Hue Shift", &ui_.hueShift, -0.5f, 0.5f, "%.2f");
 
-            ImGui::Separator();
-            ImGui::SliderFloat("Point Scale", &ui_.pointScale, 0.2f, 6.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
-            ImGui::SliderFloat("Intensity", &ui_.intensityScale, 0.2f, 3.5f, "%.2f");
-            ImGui::SliderFloat("Opacity", &ui_.opacityScale, 0.05f, 3.0f, "%.2f");
-            ImGui::SliderFloat("Splat Sharpness", &ui_.splatSharpness, 1.0f, 6.0f, "%.2f");
-            ImGui::SliderFloat("Depth Fade", &ui_.depthFade, 0.0f, 1.2f, "%.2f");
-            ImGui::SliderFloat("Gamma", &ui_.gamma, 0.6f, 2.2f, "%.2f");
-            ImGui::SliderFloat("Hue Shift", &ui_.hueShift, -0.5f, 0.5f, "%.2f");
-
-            ImGui::Spacing();
-            ImGui::DragFloatRange2("Density Window", ui_.densityRange.data(), ui_.densityRange.data() + 1, 0.005f, statsInfo_.densityMin, statsInfo_.densityMax, "Min: %.3f", "Max: %.3f");
-            if (ui_.densityRange[0] > ui_.densityRange[1]) {
-                std::swap(ui_.densityRange[0], ui_.densityRange[1]);
-            }
-
-            static const char* kColorModes[] = {"Neural RGB", "Density Viridis", "Height Bands", "Feature Divergence"};
-            ImGui::Combo("Color Mode", &ui_.colorMode, kColorModes, IM_ARRAYSIZE(kColorModes));
-            ImGui::Checkbox("Animate Tint", &ui_.animate);
-            ImGui::ColorEdit3("Background", ui_.background.data(), ImGuiColorEditFlags_NoInputs);
-
-            ImGui::Spacing();
-            if (ui_.showHistogram && pointCount_ > 0) {
-                ImGui::TextUnformatted("Density Histogram");
-                ImGui::PlotHistogram("##density_histogram", statsInfo_.histogram.data(), static_cast<int>(statsInfo_.histogram.size()), 0, nullptr, 0.0f, 1.0f, {0, 80});
-            }
+        ImGui::SeparatorText("Density Window");
+        ImGui::DragFloatRange2("##density_range", ui_.densityRange.data(), ui_.densityRange.data() + 1, 0.005f, statsInfo_.densityMin, statsInfo_.densityMax, "Min %.3f", "Max %.3f");
+        if (ui_.densityRange[0] > ui_.densityRange[1]) {
+            std::swap(ui_.densityRange[0], ui_.densityRange[1]);
         }
-        ImGui::End();
 
-        if (ImGui::Begin("Debug Stats")) {
-            const auto& camState = camera_.state();
-            ImGui::Text("Camera yaw/pitch: %.1f / %.1f deg", camState.yaw_deg, camState.pitch_deg);
-            ImGui::Text("Distance: %.2f", camState.distance);
-            ImGui::Text("Frame dt: %.3f", frm.dt_sec);
+        static const char* kColorModes[] = {"Neural RGB", "Density Viridis", "Height Bands", "Feature Divergence"};
+        ImGui::Combo("Color Mode", &ui_.colorMode, kColorModes, IM_ARRAYSIZE(kColorModes));
+        ImGui::Checkbox("Animate Tint", &ui_.animate);
+        ImGui::ColorEdit3("Background", ui_.background.data(), ImGuiColorEditFlags_NoInputs);
+
+        ImGui::Spacing();
+        ImGui::Checkbox("Show Histogram", &ui_.showHistogram);
+        if (ui_.showHistogram && pointCount_ > 0) {
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.45f, 0.75f, 1.0f, 1.0f));
+            ImGui::PlotHistogram("##density_histogram", statsInfo_.histogram.data(), static_cast<int>(statsInfo_.histogram.size()), 0, nullptr, 0.0f, 1.0f, {0, 80});
+            ImGui::PopStyleColor();
         }
-        ImGui::End();
+
+        ImGui::SeparatorText("Frame Stats");
+        const auto& camState = camera_.state();
+        ImGui::Text("Camera yaw/pitch: %.1f° / %.1f°", camState.yaw_deg, camState.pitch_deg);
+        ImGui::Text("Distance: %.2f", camState.distance);
+        ImGui::Text("Frame dt: %.3f s (%.2f ms)", frm.dt_sec, frm.dt_sec * 1000.0);
     }
 
     void build_point_field() {
