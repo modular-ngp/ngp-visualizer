@@ -100,7 +100,7 @@ namespace {
 
         UiState() {
             streamName.fill(0);
-            constexpr const char* def = "ngp_debug";
+            constexpr const char* def = "ngp_lego";
             std::strncpy(streamName.data(), def, streamName.size() - 1);
         }
     };
@@ -127,7 +127,7 @@ namespace {
     struct StreamingState {
         bool enabled{true};
         bool connected{false};
-        std::string activeStream{"ngp_debug"};
+        std::string activeStream{"ngp_lego"};
         std::string lastError{};
         uint32_t staticGen{0};
         uint64_t lastFrameId{std::numeric_limits<uint64_t>::max()};
