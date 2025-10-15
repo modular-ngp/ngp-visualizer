@@ -19,9 +19,9 @@ add_vv_example(
 
 include(FetchContent)
 FetchContent_Declare(
-        dataset
-        GIT_REPOSITORY https://github.com/modular-ngp/dataset.git
+        shared-mem-ipc
+        GIT_REPOSITORY https://github.com/HinaPE/shared-mem-ipc.git
         GIT_TAG master
 )
-FetchContent_MakeAvailable(dataset)
-target_link_libraries(ngp-visualizer PRIVATE dataset::dataset)
+FetchContent_MakeAvailable(shared-mem-ipc)
+target_link_libraries(ngp-visualizer PRIVATE shmx::shmx)
